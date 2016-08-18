@@ -58,8 +58,8 @@ public:
   void run();
   void stop();
 
-  static void readCallback (struct bufferevent *, void *ptr);
-  static void eventCallback(struct bufferevent *, short, void *ptr);
+  static void readCallback (struct bufferevent *bev, void *ptr);
+  static void eventCallback(struct bufferevent *bev, short events, void *ptr);
 };
 
 
@@ -70,10 +70,18 @@ class StratumClient {
   string  poolHost_;
   int16_t poolPort_;
   string  workerName_;
+  string  clientInfo_;
+
+  uint32_t extraNonce1_;
+  uint32_t extraNonce2Size_;
+
+  string lastPrevBlockHash_;
 
   bool handleMessage();
   void handleStratumMessage(const string &line);
   bool handleExMessage(struct evbuffer *inBuf);
+
+  int32_t getHeight(const string &coinbase1);
 
 public:
   enum State {

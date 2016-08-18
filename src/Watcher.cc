@@ -87,6 +87,14 @@ ClientContainer::ClientContainer(const string &poolsFile)
 
 }
 
+ClientContainer::~ClientContainer() {
+
+}
+
+void ClientContainer::run() {
+
+}
+
 void ClientContainer::stop() {
 
 }
@@ -96,6 +104,42 @@ size_t ClientContainer::initPoolClients() {
   return 0;
 }
 
+
+// static func
+void ClientContainer::readCallback (struct bufferevent *bev, void *ptr) {
+
+}
+
+// static func
+void ClientContainer::eventCallback(struct bufferevent *bev,
+                                    short events, void *ptr) {
+  StratumClient *client = static_cast<StratumClient *>(ptr);
+//  ClientContainer *container = client->container_;
+
+  if (events & BEV_EVENT_CONNECTED) {
+    client->state_ = StratumClient::State::CONNECTED;
+
+    // do subscribe
+    string s = Strings::Format("{\"id\":1,\"method\":\"mining.subscribe\""
+                               ",\"params\":[\"%s\"]}\n", BTCCOM_WATCHER_AGENT);
+    client->sendData(s);
+    return;
+  }
+
+  if (events & BEV_EVENT_EOF) {
+    LOG(INFO) << "upsession closed";
+  }
+  else if (events & BEV_EVENT_ERROR) {
+    LOG(ERROR) << "got an error on the upsession: "
+    << evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR());
+  }
+  else if (events & BEV_EVENT_TIMEOUT) {
+    LOG(INFO) << "upsession read/write timeout, events: " << events;
+  }
+  else {
+    LOG(ERROR) << "unhandled upsession events: " << events;
+  }
+}
 
 
 ///////////////////////////////// StratumClient //////////////////////////////
@@ -107,9 +151,12 @@ StratumClient::StratumClient(struct event_base *base, ClientContainer *container
   bev_ = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
 
   bufferevent_setcb(bev_,
-                    ClientContainer::readCallback, NULL,
+                    ClientContainer::readCallback,  NULL,
                     ClientContainer::eventCallback, this);
   bufferevent_enable(bev_, EV_READ|EV_WRITE);
+
+  clientInfo_ = Strings::Format("[%s:%d,%s]", poolHost_.c_str(),
+                                poolPort_, workerName_.c_str());
 }
 
 StratumClient::~StratumClient() {
@@ -146,8 +193,18 @@ bool StratumClient::handleMessage() {
   return false;
 }
 
+int32_t StratumClient::getHeight(const string &coinbase1) {
+  // https://github.com/bitcoin/bips/blob/master/bip-0034.mediawiki
+  const string a = coinbase1.substr(86, 2);
+  const string b = coinbase1.substr(88, 2);
+  const string c = coinbase1.substr(90, 2);
+  const string heightHex = c + b + a;  // little-endian
+
+  return atoi(heightHex.c_str());
+}
+
 void StratumClient::handleStratumMessage(const string &line) {
-  DLOG(INFO) << "UpStratumClient recv(" << line.size() << "): " << line;
+  DLOG(INFO) << clientInfo_ << " UpStratumClient recv(" << line.size() << "): " << line;
 
   JsonNode jnode;
   if (!JsonNode::parse(line.data(), line.data() + line.size(), jnode)) {
@@ -163,8 +220,9 @@ void StratumClient::handleStratumMessage(const string &line) {
     auto jparamsArr = jparams.array();
 
     if (jmethod.str() == "mining.notify") {
-//      latestJobId_[1]      = (uint8_t)jparamsArr[0].uint32();  /* job id     */
-//      latestJobGbtTime_[1] = jparamsArr[7].uint32_hex();       /* block time */
+      const int32_t  blockHeight = getHeight(jparamsArr[2].str());  /* coinbase1 */
+      const uint32_t blockTime   = jparamsArr[7].uint32_hex();      /* block time */
+      
     }
     else {
       // ignore other messages
@@ -179,7 +237,7 @@ void StratumClient::handleStratumMessage(const string &line) {
     if (jerror.type()  != Utilities::JS::type::Null ||
         jresult.type() != Utilities::JS::type::Bool ||
         jresult.boolean() != true) {
-      LOG(ERROR) << "auth fail: " << poolHost_ << ":" << poolPort_ << ", " << workerName_;
+      LOG(ERROR) << clientInfo_ <<  " auth fail";
     }
     return;
   }
@@ -190,17 +248,19 @@ void StratumClient::handleStratumMessage(const string &line) {
     //                    ["mining.notify","01000002"]],"01000002",8],"error":null}
     //
     if (jerror.type() != Utilities::JS::type::Null) {
-      LOG(ERROR) << "json result is null, err: " << jerror.str();
+      LOG(ERROR) << clientInfo_ << " json result is null, err: " << jerror.str();
       return;
     }
     std::vector<JsonNode> resArr = jresult.array();
     if (resArr.size() < 3) {
-      LOG(ERROR) << "result element's number is less than 3: " << line;
+      LOG(ERROR) << clientInfo_ << " result element's number is less than 3: " << line;
       return;
     }
 
-    uint32_t extraNonce1 = resArr[1].uint32_hex();
-    LOG(INFO) << "extraNonce1 / SessionID: " << extraNonce1;
+    extraNonce1_     = resArr[1].uint32_hex();
+    extraNonce2Size_ = resArr[2].uint32();
+    LOG(INFO) << clientInfo_ << " extraNonce1: " << extraNonce1_
+    << ", extraNonce2 Size: " << extraNonce2Size_;
 
     // subscribe successful
     state_ = SUBSCRIBED;
@@ -216,7 +276,7 @@ void StratumClient::handleStratumMessage(const string &line) {
   if (state_ == SUBSCRIBED && jresult.boolean() == true) {
     // authorize successful
     state_ = AUTHENTICATED;
-    LOG(INFO) << "auth success, name: \"" << workerName_;
+    LOG(INFO) << clientInfo_ << " auth success, name: \"" << workerName_;
     return;
   }
 }
