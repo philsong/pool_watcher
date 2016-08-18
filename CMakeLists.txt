@@ -34,8 +34,11 @@ if(NOT LibEvent_FOUND)
   message(FATAL_ERROR "libevent2 not found!")
 endif(NOT LibEvent_FOUND)
 
-include_directories(src test ${GLOG_INCLUDE_DIRS} ${LIBEVENT_INCLUDE_DIR})
-set(THRID_LIBRARIES ${GLOG_LIBRARIES} ${LIBEVENT_LIB})
+execute_process(COMMAND mysql_config --libs_r OUTPUT_VARIABLE MYSQL_LIB OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND mysql_config --include OUTPUT_VARIABLE MYSQL_INCLUDE OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+include_directories(src test ${GLOG_INCLUDE_DIRS} ${LIBEVENT_INCLUDE_DIR} ${MYSQL_INCLUDE})
+set(THRID_LIBRARIES ${GLOG_LIBRARIES} ${LIBEVENT_LIB} ${MYSQL_LIB})
 
 file(GLOB LIB_SOURCES src/*.cc)
 add_library(btcpoolwatcher STATIC ${LIB_SOURCES})
