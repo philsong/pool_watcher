@@ -18,6 +18,10 @@
  */
 #include "Watcher.h"
 
+#include <cinttypes>
+
+#include <chrono>
+
 #include <event2/event.h>
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
@@ -54,6 +58,7 @@ bool resolve(const string &host, struct	in_addr *sin_addr) {
   hints_in.ai_protocol = IPPROTO_TCP;
   hints_in.ai_flags    = EVUTIL_AI_ADDRCONFIG;
 
+  // TODO: use non-blocking to resolve hostname
   int err = evutil_getaddrinfo(host.c_str(), NULL, &hints_in, &ai);
   if (err != 0) {
     LOG(ERROR) << "evutil_getaddrinfo err: " << err << ", " << evutil_gai_strerror(err);
@@ -85,7 +90,7 @@ int32_t getBlockHeightFromCoinbase(const string &coinbase1) {
   const string c = coinbase1.substr(90, 2);
   const string heightHex = c + b + a;  // little-endian
 
-  return atoi(heightHex.c_str());
+  return (int32_t)strtol(heightHex.c_str(), nullptr, 16);
 }
 
 
@@ -106,40 +111,104 @@ string convertPrevHash(const string &prevHash) {
 
 
 ///////////////////////////////// ClientContainer //////////////////////////////
-ClientContainer::ClientContainer(const string &poolsFile,
-                                 const MysqlConnectInfo &dbInfo)
-:running_(true) , poolsFile_(poolsFile), dbInfo_(dbInfo), db_(dbInfo_)
+ClientContainer::ClientContainer(const MysqlConnectInfo &dbInfo)
+:running_(true), dbInfo_(dbInfo), db_(dbInfo_)
 {
+  base_ = event_base_new();
+  assert(base_ != nullptr);
 }
 
 ClientContainer::~ClientContainer() {
-
+  event_base_free(base_);
 }
 
 void ClientContainer::run() {
-
+  event_base_dispatch(base_);
 }
 
 void ClientContainer::stop() {
+  if (!running_)
+    return;
 
+  LOG(INFO) << "stop event loop";
+  running_ = false;
+  event_base_loopexit(base_, NULL);
 }
 
-size_t ClientContainer::initPoolClients() {
-  // read pools text file
-  return 0;
+bool ClientContainer::init() {
+  // read pools from DB
+  const string sql = "SELECT `pool_name`,`pool_host`,`pool_port`,`worker_name` FROM `pools`";
+
+  char **row;
+  MySQLResult res;
+  db_.query(sql, res);
+
+  while ((row = res.nextRow()) != nullptr) {
+    auto ptr = new StratumClient(base_, this,
+                                 // pool_name, pool_host
+                                 string(row[0]), string(row[1]),
+                                 // pool_port, worker_name
+                                 (int16_t)atoi(row[2]), string(row[3]));
+    ptr->connect();
+    clients_.push_back(ptr);
+
+    LOG(INFO) << "watch pool: " << row[0] << ", " << row[1] << ":" << row[2] << ", " << row[3];
+  }
+
+  if (clients_.size() == 0) {
+    LOG(ERROR) << "no avaiable pools";
+    return false;
+  }
+
+  return true;
 }
 
+bool ClientContainer::insertBlockInfoToDB(const string &poolName,
+                                          uint64_t jobRecvTimeMs,
+                                          int32_t blockHeight,
+                                          const string &blockPrevHash,
+                                          uint32_t blockTime) {
+  string recvTime = date("%F %T", jobRecvTimeMs/1000);
+  recvTime.append(Strings::Format(".%03d", jobRecvTimeMs % 1000));
+
+  string sql = Strings::Format("INSERT INTO `pool_block_notify` "
+                               "(`pool_name`, `job_recv_time`, `block_height`,"
+                               " `block_prev_hash`, `block_time`, `created_at`)"
+                               " VALUES (\"%s\",\"%s\",%d,\"%s\",\"%s\",\"%s\")",
+                               poolName.c_str(), recvTime.c_str(), blockHeight,
+                               blockPrevHash.c_str(),
+                               date("%F %T", blockTime).c_str(),
+                               date("%F %T", time(nullptr)).c_str());
+  return db_.execute(sql);
+}
+
+void ClientContainer::removeAndCreateClient(StratumClient *client) {
+  for (size_t i = 0; i < clients_.size(); i++) {
+    if (clients_[i] == client) {
+      auto ptr = new StratumClient(base_, this,
+                                   client->poolName_, client->poolHost_,
+                                   client->poolPort_, client->workerName_);
+      ptr->connect();
+
+      // set new object, delete old one
+      clients_[i] = ptr;
+      delete client;
+
+      break;
+    }
+  }
+}
 
 // static func
-void ClientContainer::readCallback (struct bufferevent *bev, void *ptr) {
-
+void ClientContainer::readCallback(struct bufferevent *bev, void *ptr) {
+  static_cast<StratumClient *>(ptr)->recvData();
 }
 
 // static func
 void ClientContainer::eventCallback(struct bufferevent *bev,
                                     short events, void *ptr) {
   StratumClient *client = static_cast<StratumClient *>(ptr);
-//  ClientContainer *container = client->container_;
+  ClientContainer *container = client->container_;
 
   if (events & BEV_EVENT_CONNECTED) {
     client->state_ = StratumClient::State::CONNECTED;
@@ -164,6 +233,9 @@ void ClientContainer::eventCallback(struct bufferevent *bev,
   else {
     LOG(ERROR) << "unhandled upsession events: " << events;
   }
+
+  // update client
+  container->removeAndCreateClient(client);
 }
 
 
@@ -172,18 +244,25 @@ StratumClient::StratumClient(struct event_base *base, ClientContainer *container
                              const string &poolName,
                              const string &poolHost, const int16_t poolPort,
                              const string &workerName)
-: container_(container), poolName_(poolName),
-poolHost_(poolHost), poolPort_(poolPort), workerName_(workerName)
+: container_(container), poolName_(poolName), poolHost_(poolHost),
+poolPort_(poolPort), workerName_(workerName)
 {
-  bev_ = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
+  bev_ = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
+  assert(bev_ != nullptr);
 
   bufferevent_setcb(bev_,
                     ClientContainer::readCallback,  NULL,
                     ClientContainer::eventCallback, this);
   bufferevent_enable(bev_, EV_READ|EV_WRITE);
 
-  clientInfo_ = Strings::Format("[%s:%d,%s]", poolHost_.c_str(),
-                                poolPort_, workerName_.c_str());
+  extraNonce1_ = 0;
+  extraNonce2Size_ = 0;
+
+  state_ = INIT;
+
+  // set read timeout
+  struct timeval readtv = {120, 0};
+  bufferevent_set_timeouts(bev_, &readtv, NULL);
 }
 
 StratumClient::~StratumClient() {
@@ -210,6 +289,17 @@ bool StratumClient::connect() {
   return false;
 }
 
+void StratumClient::sendData(const char *data, size_t len) {
+  // add data to a bufferevent’s output buffer
+  bufferevent_write(bev_, data, len);
+  DLOG(INFO) << "StratumClient send(" << len << "): " << data;
+}
+
+void StratumClient::recvData() {
+  while (handleMessage()) {
+  }
+}
+
 bool StratumClient::handleMessage() {
   string line;
   if (tryReadLine(line, bev_)) {
@@ -220,9 +310,8 @@ bool StratumClient::handleMessage() {
   return false;
 }
 
-
 void StratumClient::handleStratumMessage(const string &line) {
-  DLOG(INFO) << clientInfo_ << " UpStratumClient recv(" << line.size() << "): " << line;
+  DLOG(INFO) << poolName_ << " UpStratumClient recv(" << line.size() << "): " << line;
 
   JsonNode jnode;
   if (!JsonNode::parse(line.data(), line.data() + line.size(), jnode)) {
@@ -244,11 +333,15 @@ void StratumClient::handleStratumMessage(const string &line) {
       if (lastPrevBlockHash_ != prevHash) {
         const int32_t  blockHeight = getBlockHeightFromCoinbase(jparamsArr[2].str());
         const uint32_t blockTime   = jparamsArr[7].uint32_hex();
-        container_->insertBlockInfoToDB(poolName_, poolHost_, poolPort_,
-                                        (uint32_t)time(nullptr), blockHeight,
+
+        struct timeval tv;
+        gettimeofday(&tv, nullptr);
+        container_->insertBlockInfoToDB(poolName_,
+                                        (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000,
+                                        blockHeight,
                                         prevHash, blockTime);
         lastPrevBlockHash_ = prevHash;
-        LOG(INFO) << clientInfo_ << " prev block changed, height: " << blockHeight
+        LOG(INFO) << poolName_ << " prev block changed, height: " << blockHeight
         << ", prev_hash: " << prevHash;
       }
     }
@@ -265,7 +358,7 @@ void StratumClient::handleStratumMessage(const string &line) {
     if (jerror.type()  != Utilities::JS::type::Null ||
         jresult.type() != Utilities::JS::type::Bool ||
         jresult.boolean() != true) {
-      LOG(ERROR) << clientInfo_ <<  " auth fail";
+      LOG(ERROR) << poolName_ <<  " auth fail";
     }
     return;
   }
@@ -276,18 +369,18 @@ void StratumClient::handleStratumMessage(const string &line) {
     //                    ["mining.notify","01000002"]],"01000002",8],"error":null}
     //
     if (jerror.type() != Utilities::JS::type::Null) {
-      LOG(ERROR) << clientInfo_ << " json result is null, err: " << jerror.str();
+      LOG(ERROR) << poolName_ << " json result is null, err: " << jerror.str();
       return;
     }
     std::vector<JsonNode> resArr = jresult.array();
     if (resArr.size() < 3) {
-      LOG(ERROR) << clientInfo_ << " result element's number is less than 3: " << line;
+      LOG(ERROR) << poolName_ << " result element's number is less than 3: " << line;
       return;
     }
 
     extraNonce1_     = resArr[1].uint32_hex();
     extraNonce2Size_ = resArr[2].uint32();
-    LOG(INFO) << clientInfo_ << " extraNonce1: " << extraNonce1_
+    LOG(INFO) << poolName_ << " extraNonce1: " << extraNonce1_
     << ", extraNonce2 Size: " << extraNonce2Size_;
 
     // subscribe successful
@@ -304,7 +397,7 @@ void StratumClient::handleStratumMessage(const string &line) {
   if (state_ == SUBSCRIBED && jresult.boolean() == true) {
     // authorize successful
     state_ = AUTHENTICATED;
-    LOG(INFO) << clientInfo_ << " auth success, name: \"" << workerName_;
+    LOG(INFO) << poolName_ << " auth success, name: \"" << workerName_ << "\"";
     return;
   }
 }

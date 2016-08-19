@@ -42,9 +42,6 @@ class ClientContainer;
 ///////////////////////////////// ClientContainer //////////////////////////////
 class ClientContainer {
   atomic<bool> running_;
-
-  string poolsFile_;
-
   vector<StratumClient *> clients_;
 
   // libevent2
@@ -55,16 +52,17 @@ class ClientContainer {
   MySQLConnection db_;
 
 public:
-  ClientContainer(const string &poolsFile, const MysqlConnectInfo &dbInfo);
+  ClientContainer(const MysqlConnectInfo &dbInfo);
   ~ClientContainer();
 
-  size_t initPoolClients();
+  bool init();
   void run();
   void stop();
 
+  void removeAndCreateClient(StratumClient *client);
+
   bool insertBlockInfoToDB(const string &poolName,
-                           const string &poolHost, const int16_t poolPort,
-                           uint32_t jobRecvTime, uint32_t blockHeight,
+                           uint64_t jobRecvTimeMs, int32_t blockHeight,
                            const string &blockPrevHash, uint32_t blockTime);
 
   static void readCallback (struct bufferevent *bev, void *ptr);
@@ -75,12 +73,6 @@ public:
 ///////////////////////////////// StratumClient //////////////////////////////
 class StratumClient {
   struct bufferevent *bev_;
-
-  string  poolName_;
-  string  poolHost_;
-  int16_t poolPort_;
-  string  workerName_;
-  string  clientInfo_;
 
   uint32_t extraNonce1_;
   uint32_t extraNonce2Size_;
@@ -101,6 +93,11 @@ public:
   State state_;
   ClientContainer *container_;
 
+  string  poolName_;
+  string  poolHost_;
+  int16_t poolPort_;
+  string  workerName_;
+
 public:
   StratumClient(struct event_base *base, ClientContainer *container,
                 const string &poolName,
@@ -115,9 +112,6 @@ public:
   inline void sendData(const string &str) {
     sendData(str.data(), str.size());
   }
-
-  // means auth success and got at least stratum job
-  bool isAvailable();
 };
 
 #endif
