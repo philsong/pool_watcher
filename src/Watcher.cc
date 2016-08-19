@@ -189,6 +189,7 @@ void ClientContainer::removeAndCreateClient(StratumClient *client) {
                                    client->poolName_, client->poolHost_,
                                    client->poolPort_, client->workerName_);
       ptr->connect();
+      LOG(INFO) << "reconnect " << ptr->poolName_;
 
       // set new object, delete old one
       clients_[i] = ptr;
@@ -328,6 +329,10 @@ void StratumClient::handleStratumMessage(const string &line) {
 
     if (jmethod.str() == "mining.notify") {
       const string prevHash = convertPrevHash(jparamsArr[1].str());
+
+      if (lastPrevBlockHash_.empty()) {
+        lastPrevBlockHash_ = prevHash;  // first set prev block hash
+      }
       
       // stratum job prev block hash changed
       if (lastPrevBlockHash_ != prevHash) {
