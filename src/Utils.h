@@ -21,11 +21,14 @@
 
 #include "Common.h"
 
+#include <ctime>
+
 class Strings {
 public:
   static string Format(const char * fmt, ...);
   static void Append(string & dest, const char * fmt, ...);
 };
 
+string date(const char *format, const time_t timestamp);
 
 #endif
