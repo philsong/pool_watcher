@@ -23,7 +23,6 @@
 #include <event2/bufferevent.h>
 #include <event2/listener.h>
 
-
 static
 bool tryReadLine(string &line, struct bufferevent *bufev) {
   line.clear();
@@ -43,7 +42,6 @@ bool tryReadLine(string &line, struct bufferevent *bufev) {
 
   return true;
 }
-
 
 static
 bool resolve(const string &host, struct	in_addr *sin_addr) {
@@ -79,12 +77,39 @@ bool resolve(const string &host, struct	in_addr *sin_addr) {
   return true;
 }
 
+static
+int32_t getBlockHeightFromCoinbase(const string &coinbase1) {
+  // https://github.com/bitcoin/bips/blob/master/bip-0034.mediawiki
+  const string a = coinbase1.substr(86, 2);
+  const string b = coinbase1.substr(88, 2);
+  const string c = coinbase1.substr(90, 2);
+  const string heightHex = c + b + a;  // little-endian
+
+  return atoi(heightHex.c_str());
+}
+
+
+//
+// input  : 89c2f63dfb970e5638aa66ae3b7404a8a9914ad80328e9fe0000000000000000
+// output : 00000000000000000328e9fea9914ad83b7404a838aa66aefb970e5689c2f63d
+static
+string convertPrevHash(const string &prevHash) {
+  assert(prevHash.length() == 64);
+  string hash;
+  for (int i = 7; i >= 0; i--) {
+    uint32_t v = (uint32_t)strtoul(prevHash.substr(i*8, 8).c_str(), nullptr, 16);
+    hash.append(Strings::Format("%08x", v));
+  }
+  return hash;
+}
+
+
 
 ///////////////////////////////// ClientContainer //////////////////////////////
-ClientContainer::ClientContainer(const string &poolsFile)
-:running_(true) , poolsFile_(poolsFile)
+ClientContainer::ClientContainer(const string &poolsFile,
+                                 const MysqlConnectInfo &dbInfo)
+:running_(true) , poolsFile_(poolsFile), dbInfo_(dbInfo), db_(dbInfo_)
 {
-
 }
 
 ClientContainer::~ClientContainer() {
@@ -144,9 +169,11 @@ void ClientContainer::eventCallback(struct bufferevent *bev,
 
 ///////////////////////////////// StratumClient //////////////////////////////
 StratumClient::StratumClient(struct event_base *base, ClientContainer *container,
+                             const string &poolName,
                              const string &poolHost, const int16_t poolPort,
                              const string &workerName)
-: container_(container), poolHost_(poolHost), poolPort_(poolPort), workerName_(workerName)
+: container_(container), poolName_(poolName),
+poolHost_(poolHost), poolPort_(poolPort), workerName_(workerName)
 {
   bev_ = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE|BEV_OPT_THREADSAFE);
 
@@ -193,15 +220,6 @@ bool StratumClient::handleMessage() {
   return false;
 }
 
-int32_t StratumClient::getHeight(const string &coinbase1) {
-  // https://github.com/bitcoin/bips/blob/master/bip-0034.mediawiki
-  const string a = coinbase1.substr(86, 2);
-  const string b = coinbase1.substr(88, 2);
-  const string c = coinbase1.substr(90, 2);
-  const string heightHex = c + b + a;  // little-endian
-
-  return atoi(heightHex.c_str());
-}
 
 void StratumClient::handleStratumMessage(const string &line) {
   DLOG(INFO) << clientInfo_ << " UpStratumClient recv(" << line.size() << "): " << line;
@@ -220,9 +238,19 @@ void StratumClient::handleStratumMessage(const string &line) {
     auto jparamsArr = jparams.array();
 
     if (jmethod.str() == "mining.notify") {
-      const int32_t  blockHeight = getHeight(jparamsArr[2].str());  /* coinbase1 */
-      const uint32_t blockTime   = jparamsArr[7].uint32_hex();      /* block time */
+      const string prevHash = convertPrevHash(jparamsArr[1].str());
       
+      // stratum job prev block hash changed
+      if (lastPrevBlockHash_ != prevHash) {
+        const int32_t  blockHeight = getBlockHeightFromCoinbase(jparamsArr[2].str());
+        const uint32_t blockTime   = jparamsArr[7].uint32_hex();
+        container_->insertBlockInfoToDB(poolName_, poolHost_, poolPort_,
+                                        (uint32_t)time(nullptr), blockHeight,
+                                        prevHash, blockTime);
+        lastPrevBlockHash_ = prevHash;
+        LOG(INFO) << clientInfo_ << " prev block changed, height: " << blockHeight
+        << ", prev_hash: " << prevHash;
+      }
     }
     else {
       // ignore other messages

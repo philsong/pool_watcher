@@ -31,6 +31,7 @@
 #include <map>
 #include <set>
 
+#include "MySQLConnection.h"
 #include "utilities_js.hpp"
 
 
@@ -50,13 +51,21 @@ class ClientContainer {
   struct event_base *base_;
   struct event *signal_event_;
 
+  MysqlConnectInfo dbInfo_;
+  MySQLConnection db_;
+
 public:
-  ClientContainer(const string &poolsFile);
+  ClientContainer(const string &poolsFile, const MysqlConnectInfo &dbInfo);
   ~ClientContainer();
 
   size_t initPoolClients();
   void run();
   void stop();
+
+  bool insertBlockInfoToDB(const string &poolName,
+                           const string &poolHost, const int16_t poolPort,
+                           uint32_t jobRecvTime, uint32_t blockHeight,
+                           const string &blockPrevHash, uint32_t blockTime);
 
   static void readCallback (struct bufferevent *bev, void *ptr);
   static void eventCallback(struct bufferevent *bev, short events, void *ptr);
@@ -67,6 +76,7 @@ public:
 class StratumClient {
   struct bufferevent *bev_;
 
+  string  poolName_;
   string  poolHost_;
   int16_t poolPort_;
   string  workerName_;
@@ -81,8 +91,6 @@ class StratumClient {
   void handleStratumMessage(const string &line);
   bool handleExMessage(struct evbuffer *inBuf);
 
-  int32_t getHeight(const string &coinbase1);
-
 public:
   enum State {
     INIT          = 0,
@@ -95,6 +103,7 @@ public:
 
 public:
   StratumClient(struct event_base *base, ClientContainer *container,
+                const string &poolName,
                 const string &poolHost, const int16_t poolPort,
                 const string &workerName);
   ~StratumClient();
