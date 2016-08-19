@@ -23,9 +23,14 @@
 #include <errno.h>
 #include <unistd.h>
 
+#include <fstream>
+#include <streambuf>
+
 #include <glog/logging.h>
 
 #include "Watcher.h"
+#include "MySQLConnection.h"
+
 
 ClientContainer *gClientContainer = nullptr;
 
@@ -36,37 +41,33 @@ void handler(int sig) {
 }
 
 void usage() {
-  fprintf(stderr, "Usage:\n\tpoolwatcher -p \"pools.json\" -l \"log_dir\"\n");
+  fprintf(stderr, "Usage:\n\tpoolwatcher -m \"mysql.json\"\n");
 }
 
 int main(int argc, char **argv) {
-  char *optLogDir = NULL;
-  char *optPools  = NULL;
+  char *optMysql = NULL;
   int c;
 
   if (argc <= 1) {
     usage();
-    return 1;
+    exit(EXIT_SUCCESS);
   }
 
-  while ((c = getopt(argc, argv, "p:l:h")) != -1) {
+  while ((c = getopt(argc, argv, "m:h")) != -1) {
     switch (c) {
-      case 'p':
-        optPools = optarg;
-        break;
-      case 'l':
-        optLogDir = optarg;
+      case 'm':
+        optMysql = optarg;
         break;
       case 'h': default:
         usage();
-        exit(0);
+        exit(EXIT_SUCCESS);
     }
   }
 
   // Initialize Google's logging library.
   google::InitGoogleLogging(argv[0]);
-  FLAGS_log_dir = string(optLogDir);
-  FLAGS_max_log_size = 50;  // max log file size 50 MB
+  // Set whether log messages go to stderr instead of logfiles
+  FLAGS_logtostderr = true;
   FLAGS_logbuflevel = -1;
   FLAGS_stop_logging_if_full_disk = true;
 
@@ -74,20 +75,34 @@ int main(int argc, char **argv) {
   signal(SIGINT,  handler);
 
   try {
-    gClientContainer = new ClientContainer(string(optPools));
+    JsonNode j;  // mysql conf json
 
-    if (gClientContainer->initPoolClients() == 0) {
-      LOG(FATAL) << "init pools failure";
+    // parse mysql.json to dbInfo
+    std::ifstream mysqlConf(optMysql);
+    string mysqlJsonStr((std::istreambuf_iterator<char>(mysqlConf)),
+                        std::istreambuf_iterator<char>());
+    if (!JsonNode::parse(mysqlJsonStr.c_str(),
+                         mysqlJsonStr.c_str() + mysqlJsonStr.length(), j)) {
+      exit(EXIT_FAILURE);
+    }
+
+    MysqlConnectInfo dbInfo(j["host"].str(), j["port"].int16(),
+                            j["username"].str(), j["password"].str(),
+                            j["dbname"].str());
+    gClientContainer = new ClientContainer(dbInfo);
+
+    if (gClientContainer->init() == false) {
+      LOG(ERROR) << "init failure";
     } else {
       gClientContainer->run();
     }
     delete gClientContainer;
   }
   catch (std::exception & e) {
-    LOG(FATAL) << "exception: " << e.what();
-    return 1;
+    LOG(ERROR) << "exception: " << e.what();
+    return EXIT_FAILURE;
   }
 
   google::ShutdownGoogleLogging();
-  return 0;
+  return EXIT_SUCCESS;
 }
